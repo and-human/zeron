@@ -99,6 +99,11 @@ pub(crate) struct MessageFrame {
     /// Terse assistant-level error code (`rate_limit`, `billing_error`, …).
     #[serde(default)]
     pub error: Option<String>,
+    /// A tool result's structured echo. For a background Workflow launch it
+    /// names the run's `transcriptDir`, where each agent writes its own
+    /// `agent-<agentId>.jsonl`. A plain string on some tools.
+    #[serde(default, alias = "toolUseResult")]
+    pub tool_use_result: Option<Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -135,6 +140,9 @@ pub(crate) struct ContentBlock {
     pub name: String,
     #[serde(default)]
     pub input: Value,
+    /// A `tool_result`'s body: a string or an array of text blocks.
+    #[serde(default)]
+    pub content: Value,
     #[serde(default)]
     pub tool_use_id: String,
     #[serde(default)]

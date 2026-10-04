@@ -149,6 +149,22 @@ fn workflow_agent_line(agent: &Value, index: u64, terminal: Option<bool>) -> Str
     }
 }
 
+/// The `Transcript dir: <path>` line of a Workflow launch result's text.
+fn transcript_dir_line(content: &Value) -> Option<String> {
+    let text = match content {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => return None,
+    };
+    text.lines()
+        .find_map(|l| l.trim().strip_prefix("Transcript dir:"))
+        .map(|d| d.trim().to_owned())
+}
+
 /// A workflow agent's settled state: `Some(is_error)`, `None` while live.
 fn workflow_terminal(state: &str) -> Option<bool> {
     match state {
@@ -352,6 +368,13 @@ pub(crate) struct Normalizer {
     /// Workflow spawns → last (settled, total) agent counts summarized onto
     /// the chip; a new summary goes out only when the counts move.
     workflow_counts: std::collections::HashMap<String, (usize, usize)>,
+    /// Workflow spawns → the run's transcript dir (from the launch result).
+    workflow_dirs: std::collections::HashMap<String, std::path::PathBuf>,
+    /// Agent transcripts to follow, as they become known: (file, agent chip
+    /// id). Drained by the run loop into the [`super::workflow_tail`] reader.
+    workflow_transcripts: Vec<(std::path::PathBuf, String)>,
+    /// Agent chip ids whose transcript is already followed.
+    workflow_followed: std::collections::HashSet<String>,
     /// Rotates at each assistant-frame close and at each steer; SessionStarted
     /// carries the first value so folds can attribute deltas from the start.
     assistant_message_id: String,
@@ -370,6 +393,9 @@ impl Normalizer {
             workflow_agents: std::collections::HashMap::new(),
             workflow_phases: std::collections::HashSet::new(),
             workflow_counts: std::collections::HashMap::new(),
+            workflow_dirs: std::collections::HashMap::new(),
+            workflow_transcripts: Vec::new(),
+            workflow_followed: std::collections::HashSet::new(),
             assistant_message_id: new_message_id(),
             session_id: None,
         }
@@ -489,6 +515,19 @@ impl Normalizer {
         (prev, self.assistant_message_id.clone())
     }
 
+    /// Agent transcripts newly known since the last call: (file, chip id).
+    pub fn take_workflow_transcripts(&mut self) -> Vec<(std::path::PathBuf, String)> {
+        std::mem::take(&mut self.workflow_transcripts)
+    }
+
+    /// Whether tagged traffic for `parent` belongs to a workflow — the spawn
+    /// itself or one of its agent chips (`<spawn>:wf<index>`). Their settles
+    /// must queue behind the transcript reader so no line lands after them.
+    pub fn is_workflow_parent(&self, parent: &str) -> bool {
+        let spawn = parent.split_once(":wf").map_or(parent, |(spawn, _)| spawn);
+        self.workflow_counts.contains_key(spawn)
+    }
+
     /// A workflow's `task_progress` → its doc: a heading per phase and one
     /// agent chip per agent, re-emitted (same id, replaced in place) whenever
     /// its live line changes, and resolved when it reaches a terminal state.
@@ -547,6 +586,17 @@ impl Normalizer {
                     },
                 ));
             }
+            // The agent's own transcript, once both its id and the run's dir
+            // are known: the chip then links to it like any subagent.
+            if let (Some(agent_id), Some(dir)) = (
+                opt_str_field(agent, "agentId")
+                    .filter(|a| !a.is_empty() && a.chars().all(|c| c.is_ascii_alphanumeric())),
+                self.workflow_dirs.get(&spawn),
+            ) && self.workflow_followed.insert(id.clone())
+            {
+                self.workflow_transcripts
+                    .push((dir.join(format!("agent-{agent_id}.jsonl")), id.clone()));
+            }
             if previous.as_ref().map(|(s, _)| s) == Some(&state) {
                 continue;
             }
@@ -556,11 +606,25 @@ impl Normalizer {
             out.push(tag(
                 &spawn,
                 AgentEvent::ToolResult {
-                    id,
+                    id: id.clone(),
                     is_error,
                     output: opt_str_field(agent, "resultPreview")
                         .or_else(|| opt_str_field(agent, "error")),
                     diff: None,
+                },
+            ));
+            // The agent's own transcript settles with it.
+            out.push(tag(
+                &id,
+                AgentEvent::Done {
+                    status: if is_error {
+                        DoneStatus::Errored
+                    } else {
+                        DoneStatus::Completed
+                    },
+                    result: None,
+                    error: None,
+                    session_id: None,
                 },
             ));
         }
@@ -916,6 +980,23 @@ impl Normalizer {
                             .map(|b| tag(parent, AgentEvent::UserMessage { text: b.text })),
                     );
                     return out;
+                }
+                // A Workflow launch result names where its agents write their
+                // transcripts: the structured echo first, its text as backup.
+                for b in f.message.blocks().filter(|b| b.kind == "tool_result") {
+                    if !self.workflow_counts.contains_key(&b.tool_use_id) {
+                        continue;
+                    }
+                    let dir = f
+                        .tool_use_result
+                        .as_ref()
+                        .and_then(|r| r.get("transcriptDir"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .or_else(|| transcript_dir_line(&b.content));
+                    if let Some(dir) = dir.filter(|d| !d.is_empty()) {
+                        self.workflow_dirs.insert(b.tool_use_id.clone(), dir.into());
+                    }
                 }
                 f.message
                     .blocks()
@@ -1769,6 +1850,16 @@ mod tests {
                         diff: None,
                     }
                 ),
+                // The agent's own transcript settles with it.
+                tag(
+                    "toolu_wf:wf2",
+                    AgentEvent::Done {
+                        status: DoneStatus::Completed,
+                        result: None,
+                        error: None,
+                        session_id: None,
+                    }
+                ),
                 summary("1/2 agents"),
             ]
         );
@@ -1784,6 +1875,52 @@ mod tests {
         );
         // Progress for a task never seen as a spawn is ignored.
         assert!(normalize_one(&progress("start", "start", started)).is_empty());
+    }
+
+    #[test]
+    fn workflow_launch_result_names_each_agents_transcript() {
+        for (echo, content) in [
+            // The structured echo (2.1.285 stream-json)…
+            (
+                r#","tool_use_result":{"status":"async_launched","transcriptDir":"/cfg/s1/subagents/workflows/wf_1"}"#,
+                "Workflow launched in background.",
+            ),
+            // …or, without it, the result text's own line.
+            (
+                "",
+                "Workflow launched in background.\\nTranscript dir: /cfg/s1/subagents/workflows/wf_1\\nRun ID: wf_1",
+            ),
+        ] {
+            let mut norm = Normalizer::new();
+            let mut feed = |raw: &str| {
+                norm.normalize(
+                    crate::claude::wire::parse_frame(raw).expect("parses"),
+                    false,
+                );
+            };
+            feed(
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_wf","name":"Workflow","input":{"script":"x"}}]}}"#,
+            );
+            feed(&format!(
+                r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_wf","content":"{content}"}}]}}{echo}}}"#
+            ));
+            feed(
+                r#"{"type":"system","subtype":"task_progress","tool_use_id":"toolu_wf","workflow_progress":[{"type":"workflow_agent","index":1,"label":"a","agentId":"a64c421077cdd17f0","startedAt":1,"state":"start"},{"type":"workflow_agent","index":2,"label":"b","state":"start"}]}"#,
+            );
+            // Only the started agent (it has an id) is followed, once.
+            assert_eq!(
+                norm.take_workflow_transcripts(),
+                [(
+                    std::path::PathBuf::from(
+                        "/cfg/s1/subagents/workflows/wf_1/agent-a64c421077cdd17f0.jsonl"
+                    ),
+                    "toolu_wf:wf1".to_owned()
+                )]
+            );
+            assert!(norm.take_workflow_transcripts().is_empty());
+            assert!(norm.is_workflow_parent("toolu_wf") && norm.is_workflow_parent("toolu_wf:wf1"));
+            assert!(!norm.is_workflow_parent("toolu_agent"));
+        }
     }
 
     #[test]

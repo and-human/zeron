@@ -15,7 +15,7 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use tokio::sync::{Mutex, mpsc};
 
-use zeron_doc::{MessagePart, SessionMessageEntry, SubagentStatus};
+use zeron_doc::{MessagePart, MessageRole, SessionMessageEntry, SubagentStatus};
 use zeron_engine::{EngineCore, HarnessRegistry};
 use zeron_harness::{Harness, HarnessError, RunControls};
 use zeron_proto::{
@@ -294,5 +294,104 @@ async fn summary_restamps_a_parked_workflow_chip_in_place() {
     assert!(
         !text.contains("agents"),
         "summary leaked into the transcript: {text}"
+    );
+}
+
+/// A workflow's agent rows are NESTED spawns: each links to its own live
+/// transcript and carries its lifecycle inside the workflow's doc, while the
+/// chat doc only ever holds the workflow chip.
+#[tokio::test]
+async fn workflow_agent_rows_link_to_their_own_transcripts() {
+    let Run { core, feed, _dir } = spawn_workflow().await;
+    feed.send(done(DoneStatus::Completed)).unwrap();
+    wait_for(
+        || {
+            core.sessions
+                .session_status(CHAT)
+                .is_some_and(|s| s.status == SessionStatus::Idle)
+        },
+        "park after Done",
+    )
+    .await;
+    const ROW: &str = "toolu_wf:wf1";
+    let nested = |event: AgentEvent| AgentEvent::Subagent {
+        parent_tool_use_id: ROW.into(),
+        event: Box::new(event),
+    };
+    for event in [
+        tagged(AgentEvent::ToolCall {
+            id: ROW.into(),
+            call: ToolCall::Unknown {
+                name: "Agent: scan-a — Bash: ls".into(),
+                input: Some(serde_json::json!({"model": "claude-haiku-4-5"})),
+            },
+        }),
+        nested(AgentEvent::UserMessage {
+            text: "List files.".into(),
+        }),
+        nested(AgentEvent::TextDelta {
+            text: "AssetCacheLocatorUtil".into(),
+        }),
+    ] {
+        feed.send(event).unwrap();
+    }
+    let workflow_doc = || {
+        let (sub_ref, _, _) = chip(&core)?;
+        core.doc_host
+            .open(&sub_ref?)
+            .ok()?
+            .doc()
+            .read_entries()
+            .ok()
+    };
+    let row = || {
+        workflow_doc()?
+            .iter()
+            .flat_map(|e| e.parts.clone())
+            .find_map(|p| match p {
+                MessagePart::Tool {
+                    id,
+                    subagent_ref,
+                    subagent_status,
+                    ..
+                } if id == ROW => Some((subagent_ref, subagent_status)),
+                _ => None,
+            })
+    };
+    wait_for(
+        || row().is_some_and(|(r, s)| r.is_some() && s == Some(SubagentStatus::Running)),
+        "row linked and running",
+    )
+    .await;
+    feed.send(nested(done(DoneStatus::Completed))).unwrap();
+    feed.send(tagged(done(DoneStatus::Completed))).unwrap();
+    wait_for(
+        || row().is_some_and(|(_, s)| s == Some(SubagentStatus::Done)),
+        "row settled",
+    )
+    .await;
+    let (row_ref, _) = row().unwrap();
+    let agent_text: String = core
+        .doc_host
+        .open(&row_ref.unwrap())
+        .unwrap()
+        .doc()
+        .read_entries()
+        .unwrap()
+        .iter()
+        .filter(|e| e.role == MessageRole::Assistant)
+        .flat_map(|e| &e.parts)
+        .filter_map(|p| match p {
+            MessagePart::Text { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(agent_text, "AssetCacheLocatorUtil");
+    // The chat doc holds only the workflow chip, never the agent row.
+    assert!(
+        entries(&core)
+            .iter()
+            .flat_map(|e| &e.parts)
+            .all(|p| !matches!(p, MessagePart::Tool { id, .. } if id == ROW))
     );
 }
